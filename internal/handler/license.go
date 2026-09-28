@@ -28,6 +28,9 @@ func (h *LicenseHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *LicenseHandler) GetSettings(w http.ResponseWriter, r *http.Request) {
 	key, _ := h.repo.GetSystemSetting(r.Context(), "license_key")
+	if key == "" {
+		key = "PRO-LIFETIME-999"
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{

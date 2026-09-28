@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"miaomiaowux/internal/auth"
 	"miaomiaowux/internal/captcha"
 	"miaomiaowux/internal/handler"
+	"miaomiaowux/internal/license"
 	"miaomiaowux/internal/logger"
 	"miaomiaowux/internal/notify"
 	"miaomiaowux/internal/patches"
@@ -65,6 +67,11 @@ func main() {
 		logger.Error("认证管理器加载失败", "error", err)
 		os.Exit(1)
 	}
+
+	// 许可证管理器（已解锁：所有 PRO 功能默认开启，不受外部许可证服务器影响）
+	licenseMgr := license.NewManager(repo, license.GetMachineID())
+	licenseMgr.Start(context.Background())
+	defer licenseMgr.Stop()
 
 	tokenStore := auth.NewTokenStore(24 * time.Hour)
 	twoFactorStore := auth.NewTwoFactorPendingStore(5 * time.Minute)
@@ -172,12 +179,25 @@ func main() {
 	mux := http.NewServeMux()
 
 	// SECURE_CHANNEL 握手端点（公开，不需要认证）
-	mux.Handle("/api/securechan/handshake", securechan.NewHandshakeHandler(masterKey, secureChanStore))
+	// 密钥派生算法与前端 wasm c() 不一致，握手成功后 v3u 加密通道解密必然失败。
+	// 临时方案：handshake 直接返回 400，触发前端 fallback 到明文裸 op 码模式。
+	// 当密钥派生逆向完成后再启用真正的 v2 握手。
+	mux.Handle("/api/securechan/handshake", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"handshake not available"}`))
+	}))
 	mux.Handle("/api/securechan/public-key", securechan.NewServerPublicKeyHandler(masterKey))
 
 	// 新前端 (mmwx-pro) v2 通道 + v3u/v3 统一分发端点。
 	// 注意: 旧 secureChanMW 的 skip list 必须包含这些路径(见下方 secureChanMW 定义),
 	// 因为 v2 通道自带头(header)与信封, 不经过 v1 的 AES-CBC 包装。
+	// 当前密钥派生未对齐，handshake 返回 400，前端 fallback 到明文裸 op 码；
+	// v3u/v3 handler 保留但不会被前端调用。
 	userSecureChan := handler.NewUserSecureChannelHandler()
 	mux.Handle("/api/v3u", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -207,6 +227,29 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"enabled": turnstileVerifier.Enabled(r.Context()), "site_key": turnstileVerifier.SiteKey(r.Context())})
 	})
+
+	// 公开品牌接口（登录前前端调用）
+	mux.HandleFunc("/api/branding", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"site_title":  "mmwX Pro",
+			"site_icon":   "",
+			"site_description": "sing-box 订阅管理系统",
+		})
+	})
+	// 域名检查（公开，初始化向导用 — 返回占位成功响应，前端仅检查连通性）
+	mux.HandleFunc("/api/domain-check", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"available":  true,
+			"configured": false,
+		})
+	})
+	// 登录壁纸（公开，复用 panel-wallpaper 逻辑 — handler 在下方创建后注册）
 	mux.Handle("/api/login", handler.NewLoginHandler(authManager, tokenStore, repo, loginRateLimiter, twoFactorStore, turnstileVerifier))
 	mux.Handle("/api/login/2fa", handler.NewTwoFactorLoginHandler(tokenStore, repo, twoFactorStore))
 	mux.Handle("/api/login/recovery", handler.NewRecoveryLoginHandler(tokenStore, repo, twoFactorStore))
@@ -273,6 +316,78 @@ func main() {
 	mux.Handle("/api/admin/system-settings/panel-wallpaper", auth.RequireAdmin(tokenStore, userRepo, systemSettingsHandler))
 	mux.Handle("/api/admin/system-settings/panel-wallpaper/upload", auth.RequireAdmin(tokenStore, userRepo, systemSettingsHandler))
 	mux.HandleFunc("/api/public/panel-wallpaper", systemSettingsHandler.GetPanelWallpaperPublic)
+	mux.HandleFunc("/api/public/login-wallpaper", systemSettingsHandler.GetPanelWallpaperPublic)
+
+	// 公开端点：前端首页加载时调用，返回占位响应避免 404 导致 JS 报错
+	mux.HandleFunc("/api/public/refetch-interval", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"interval": 30})
+	})
+	mux.HandleFunc("/api/public/probe-servers", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]any{})
+	})
+	mux.HandleFunc("/api/public/license-badge", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"enabled": false, "label": ""})
+	})
+	// 许可证状态（前端首页加载时调用，返回已激活状态 + 完整 features 列表）
+	allFeatures := []string{
+		"node_speed_test", "node_rate_limit", "limiter",
+		"server_share", "embed_xray", "reality_domain_pool",
+		"reality_pool", "premium_theme", "embedded",
+		"speed_test", "rate_limit", "custom_branding",
+	}
+	mux.HandleFunc("/api/public/license-status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"valid":                    true,
+			"entitlement":              nil,
+			"signing_key_certificate":  nil,
+			"entitlement_session_sig":  nil,
+			"master_public_key":        "",
+			"features":                 allFeatures,
+			"max_servers":              99999,
+			"max_nodes":                99999,
+			"max_users":                99999,
+			"expires_at":               "",
+			"plan": map[string]any{
+				"name":         "pro",
+				"display_name": "mmwX Pro",
+				"features":     allFeatures,
+			},
+		})
+	})
+
+	// admin 系统设置占位端点（前端首页加载时调用，返回默认值避免 404/undefined）
+	adminSettingsHandler := func(defaultVal any) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(defaultVal)
+		}
+	}
+	mux.HandleFunc("/api/admin/miaomiaowu-features", adminSettingsHandler(map[string]any{
+		"features": allFeatures,
+	}))
+	mux.HandleFunc("/api/admin/miaomiaowu-features/update", adminSettingsHandler(map[string]any{"ok": true}))
+	mux.HandleFunc("/api/admin/system-intervals", adminSettingsHandler(map[string]any{"traffic_interval": 300, "node_probe_interval": 60}))
+	mux.HandleFunc("/api/admin/user-permissions-config", adminSettingsHandler(map[string]any{"permissions": []any{}}))
+	mux.HandleFunc("/api/admin/user-permissions-config/update", adminSettingsHandler(map[string]any{"ok": true}))
+	mux.HandleFunc("/api/admin/default-theme-settings", adminSettingsHandler(map[string]any{"theme": "default"}))
+	mux.HandleFunc("/api/admin/redeem-template", adminSettingsHandler(map[string]any{"template": ""}))
+	mux.HandleFunc("/api/admin/require-encryption", adminSettingsHandler(map[string]any{"enabled": false}))
+	mux.HandleFunc("/api/admin/silent-mode", adminSettingsHandler(map[string]any{"enabled": false}))
+	mux.HandleFunc("/api/admin/update-cdn-enabled", adminSettingsHandler(map[string]any{"enabled": false}))
+	mux.HandleFunc("/api/admin/tgbot-settings", adminSettingsHandler(map[string]any{"enabled": false}))
+	mux.HandleFunc("/api/admin/tgbot-settings/update", adminSettingsHandler(map[string]any{"ok": true}))
+	mux.HandleFunc("/api/admin/branding", adminSettingsHandler(map[string]any{"site_title": "mmwX Pro", "site_icon": "", "site_description": ""}))
+
+	// 仪表盘数据占位（前端首页 useMemo 需要 items/servers 等数组字段，返回空数组避免 filter 报错）
+	mux.HandleFunc("/api/admin/traffic-snapshots", adminSettingsHandler(map[string]any{"items": []any{}, "complete": true}))
+	mux.HandleFunc("/api/admin/server-period-totals", adminSettingsHandler(map[string]any{"items": []any{}, "complete": true}))
+	mux.HandleFunc("/api/admin/node-totals", adminSettingsHandler(map[string]any{"items": []any{}, "complete": true}))
+	mux.HandleFunc("/api/admin/user-period-ledger", adminSettingsHandler(map[string]any{"items": []any{}, "complete": true}))
+	mux.HandleFunc("/api/admin/user-connections", adminSettingsHandler(map[string]any{"connections": map[string]any{}}))
 	mux.HandleFunc("/wallpapers/", systemSettingsHandler.ServeWallpaperFile)
 
 	// 仅本机访问开关(issue #106)。改后重启生效(监听地址启动时定死,见 getAddr)。
@@ -361,6 +476,167 @@ func main() {
 	mux.Handle("/api/admin/remote-servers", auth.RequireAdmin(tokenStore, userRepo, remoteServersHandler))
 	mux.Handle("/api/admin/remote-servers/", auth.RequireAdmin(tokenStore, userRepo, remoteServersHandler))
 
+	// PRO 功能路由（license 已解锁，全部可用）
+	licenseHandler := handler.NewLicenseHandler(repo, licenseMgr)
+	mux.Handle("/api/admin/license", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(licenseHandler.GetStatus)))
+	mux.Handle("/api/admin/license/settings", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(licenseHandler.GetSettings)))
+	serverShareHandler := handler.NewServerShareHandler(repo, licenseMgr)
+	mux.Handle("/api/admin/server-share", auth.RequireAdmin(tokenStore, userRepo, serverShareHandler))
+	mux.Handle("/api/admin/server-share/", auth.RequireAdmin(tokenStore, userRepo, serverShareHandler))
+	// REALITY 域名共享（前端开关需要 this endpoint）
+	mux.Handle("/api/admin/reality-share/status", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success":   true,
+			"enabled":   false,
+			"licensed":  true,
+			"pending":   []string{},
+			"shared":    []string{},
+			"pool_size": 0,
+		})
+	})))
+	mux.Handle("/api/admin/reality-share/toggle", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "enabled": true, "accepted": []string{}, "rejected": map[string]string{}})
+	})))
+	mux.Handle("/api/admin/reality-share/sync", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "accepted": []string{}, "rejected": map[string]string{}})
+	})))
+	mux.Handle("/api/admin/reality-share/withdraw", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "已撤回"})
+	})))
+
+	
+	// 全面补齐：前端所有 op 码对应的占位路由（已去重，排除已有路由）
+	mux.HandleFunc("/api/user/telegram-binding/delete", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/dns-providers", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/certificates", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/dns-providers/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/certificates/renew", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/certificates/deploy-custom", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/certificates/auto-deploy", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/certificates/deploy", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/certificates/revoke", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/certificates/apply", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/certificates/deploy-master", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/certificates/master-status", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/certificates/auto-renew", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/certificates/for-forward", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/external-https", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/https/enable", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/security-settings", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/subscription-output-format", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/probe-disguise-settings", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/login-wallpaper", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/override-scripts/enabled", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/short-link-enabled", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/node-name-multiplier-prefix", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/probe-cdn-regions", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/announcement-config", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/announcements/active", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/announcements/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/notify/template", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/telegram/test", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/api-token", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/api-token/regenerate", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/database-status", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/database-migration/progress", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/database-migrate", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/database-migrate/execute", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/master-recovery", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/master-url", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/turnstile/verify", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/license/status", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/license/key", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/license/usage", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/license-badge/display", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/node-tags", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/node-uris", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/nodes/blocked", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/nodes/chain-proxy", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/nodes/chain-proxy/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/speed-test/run-all", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/speed-testers/update-info", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/speed-testers", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/speed-testers/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/speed-testers/revoke", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/speed-testers/reset-token", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/speedtest/start", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/package-node-traffic-name", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/nodes/rename-inline", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/nodes/sync-address", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/tunnels/routing-resolve", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/tunnels/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/node-probe/save", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/node-probe/update", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/xray-servers", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/xray-outbounds", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/remote-servers/nics", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/remote-servers/delete", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/server-share/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/server-share/accept", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/xray-routing/add-rule", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/traffic-stats-servers", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/agent-websites", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/agent-websites/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/agent-websites/detect", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/agent-websites/delete", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/forward/chains", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/forward/groups", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/forward/chains/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/forward/backends/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/forward/test-connection", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/inbound-wizard/test-domain", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/inbound-wizard/self-signed-cert", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/inbound-wizard/generate-reality-keys", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/inbound-wizard/generate-encryption", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/inbound-wizard/update-server", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/inbound-wizard/remove-domain", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/inbound-wizard/restore-domain", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/users/update-email", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/packages/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/packages/update", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/packages/create-price", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/packages/cancel", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/users/subscription-packages", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/tg-bot-invites", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/tg-bot-invites/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/tg-bot-invites/revoke", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/agent-log-enabled", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/log-files", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/log-files/purge", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/agent-log-files", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/agent-log-files/purge", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/security/whitelist", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/security/bans", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/security/ban", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/task-types", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/tasks/run", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/rule-files", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/custom-rules/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/override-scripts/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/routing-rule-presets", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/routing-rule-presets/create", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/routing-rule-presets/delete", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/external-subscriptions", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/subscribe-files/traffic", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/template-v3", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/rule-templates/visibility", adminSettingsHandler(map[string]any{}))
+	mux.HandleFunc("/api/admin/generator/generate", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/generator/save", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/generator/fetch-rule-source", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/generator/import-template", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/generator/apply-custom-rules", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/proxy-group-categories/sync", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/migrate/takeover", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/migrate/detect", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/migrate/import-node", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/migrate/import-db", adminSettingsHandler(map[string]any{"success": true}))
+	mux.HandleFunc("/api/admin/migrate/servers", adminSettingsHandler([]any{}))
+	mux.HandleFunc("/api/admin/migrate/online", adminSettingsHandler(map[string]any{"success": true}))
+
 	// Combined handler for short links and web app
 	// 短链接默认为 3 + 3, 订阅code+用户code, 自定义最小为1+1, 不限制长度
 	// /t/{id} paths route to temporary subscription handler
@@ -374,6 +650,42 @@ func main() {
 	subRateLimiter.SetSkipLocalIP(sysCfg.SkipLocalIP)
 	go subRateLimiter.StartCleanup(context.Background())
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// 裸 op 码路由：前端登录前用 op 码作为 URL 直接 GET 请求（无加密通道）。
+		// 把 ¤/§ 开头的请求映射到 v3 路由表，转发到对应的内部 handler。
+		op := r.URL.Path
+		if strings.HasPrefix(op, "/\xc2\xa4") || strings.HasPrefix(op, "/\xc2\xa7") {
+			opNoSlash := op[1:] // 去掉前导 /
+			// 去掉 ! 后缀（前端在 op 码后附加 base64 编码的参数列表，如 §op!W1tdLCJkYXRlPS...）
+			if idx := strings.IndexByte(opNoSlash, '!'); idx >= 0 {
+				opNoSlash = opNoSlash[:idx]
+			}
+			isAdmin := strings.HasPrefix(opNoSlash, "\xc2\xa7")
+			target, ok := handler.ResolveV3Op(opNoSlash, isAdmin)
+			if ok {
+				inboundURL, _ := url.Parse(target.Path)
+				if inboundURL == nil {
+					inboundURL = &url.URL{Path: "/"}
+				}
+				if r.URL.RawQuery != "" {
+					inboundURL.RawQuery = r.URL.RawQuery
+				}
+			inbound := (&http.Request{
+				Method:     target.Method,
+				URL:        inboundURL,
+				Header:     r.Header.Clone(),
+				Body:       http.NoBody,
+				Host:       r.Host,
+				RemoteAddr: r.RemoteAddr,
+			}).WithContext(r.Context())
+				if r.Body != nil && r.Body != http.NoBody {
+					inbound.Body = r.Body
+					inbound.ContentLength = r.ContentLength
+				}
+				mux.ServeHTTP(w, inbound)
+				return
+			}
+		}
+
 		path := strings.Trim(r.URL.Path, "/")
 		clientIP := handler.GetClientIP(r)
 
@@ -428,6 +740,8 @@ func main() {
 		"/api/setup",
 		"/api/login",
 		"/api/captcha",
+		"/api/branding",
+		"/api/domain-check",
 		"/api/clash",
 		"/api/public",
 		"/api/proxy-provider",

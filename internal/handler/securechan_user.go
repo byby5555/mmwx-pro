@@ -261,6 +261,9 @@ func (h *UserSecureChannelHandler) handleV3Request(w http.ResponseWriter, r *htt
 
 	plaintext, err := h.decryptEnvelopeBody(entry, r)
 	if err != nil {
+		// 密钥派生不一致导致解密失败。handshake 已返回 400 触发前端 fallback，
+		// 此处不应被到达（前端 fallback 后不走 v3u），但保留防御性处理。
+		log.Printf("[v3] decrypt failed for sid=%s: %v", safePrefix(sid, 8), err)
 		http.Error(w, "decrypt failed", http.StatusBadRequest)
 		return
 	}

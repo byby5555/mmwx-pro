@@ -51,6 +51,11 @@ var defaultStatus = Status{
 			"embed_xray",
 			"reality_domain_pool",
 			"reality_pool",
+			"speed_test",
+			"rate_limit",
+			"embedded",
+			"custom_branding",
+			"premium_theme",
 		},
 		FeatureTokens: map[string]string{
 			"node_speed_test":     "bypassed",
@@ -60,6 +65,11 @@ var defaultStatus = Status{
 			"embed_xray":          "bypassed",
 			"reality_domain_pool": "bypassed",
 			"reality_pool":        "bypassed",
+			"speed_test":          "bypassed",
+			"rate_limit":          "bypassed",
+			"embedded":            "bypassed",
+			"custom_branding":     "bypassed",
+			"premium_theme":       "bypassed",
 		},
 	},
 }

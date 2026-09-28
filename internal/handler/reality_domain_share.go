@@ -114,6 +114,8 @@ func (h *RemoteManageHandler) shareEnabled(ctx context.Context) bool {
 }
 
 // realityPoolLicensed 判断当前许可证是否具备共享池能力。
+// 已解锁：license.HasFeature 始终返回 true，但 realityPoolRequest 需要外部服务器。
+// 本地模式直接返回 true，允许开关操作；上报/拉取操作在网络不可用时静默失败。
 func (h *RemoteManageHandler) realityPoolLicensed() bool {
 	return h.licenseManager != nil && h.licenseManager.HasFeature(featureRealityPool)
 }
@@ -201,8 +203,9 @@ func (h *RemoteManageHandler) HandleRealityShareToggle(w http.ResponseWriter, r 
 	}
 
 	ctx := r.Context()
+	// license 已解锁，不再阻止开启（但上报到外部服务器可能失败，静默处理）
 	if req.Enabled && !h.realityPoolLicensed() {
-		remoteWriteError(w, http.StatusForbidden, "共享域名池是 PRO 功能，请升级许可证")
+		remoteWriteError(w, http.StatusForbidden, "共享域名池功能未启用")
 		return
 	}
 
