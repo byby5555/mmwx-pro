@@ -96,8 +96,8 @@ services:
 
 ```bash
 # Linux
-chmod +x mmwf-linux-amd64
-./mmwf-linux-amd64
+chmod +x mmwx-linux-amd64
+./mmwx-linux-amd64
 ```
 
 默认端口 `8080`，访问 `http://服务器IP:8080` 进入初始化向导。
@@ -155,7 +155,7 @@ connection_mode: "auto"   # auto | websocket | http | pull
 
 ```bash
 # 交叉编译 Linux amd64
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o build/mmwf-linux-amd64 ./cmd/server
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o build/mmwx-linux-amd64 ./cmd/server
 ```
 
 ## 免责声明

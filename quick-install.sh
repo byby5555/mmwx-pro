@@ -1,10 +1,11 @@
 #!/bin/bash
-# 妙妙屋 - 一键安装命令（简化版）
+# mmwX Pro - sing-box 订阅管理系统 一键安装命令（简化版）
+# 适用于 Debian/Ubuntu Linux 系统
 
 set -e
 
-VERSION="v0.3.5"
-GITHUB_REPO="Jimleerx/miaomiaowu"
+VERSION="v0.6.0-pro"
+GITHUB_REPO="byby5555/mmwx-pro"
 VERSION_FILE=".version"
 PORT_FILE=".port"
 
@@ -12,13 +13,13 @@ PORT_FILE=".port"
 ARCH=$(uname -m)
 case "$ARCH" in
     x86_64|amd64)
-        BINARY_NAME="mmw-linux-amd64"
+        BINARY_NAME="mmwx-linux-amd64"
         ;;
     aarch64|arm64)
-        BINARY_NAME="mmw-linux-arm64"
+        BINARY_NAME="mmwx-linux-arm64"
         ;;
     *)
-        echo "❌ 不支持的架构: $ARCH"
+        echo "不支持的系统架构: $ARCH"
         echo "支持的架构: x86_64 (amd64), aarch64 (arm64)"
         exit 1
         ;;
@@ -28,13 +29,13 @@ DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${B
 
 # 安装函数
 install() {
-    echo "正在下载并安装妙妙屋X $VERSION ($ARCH)..."
+    echo "正在下载并安装 mmwX Pro $VERSION ($ARCH)..."
 
     # 下载
-    wget -q --show-progress "$DOWNLOAD_URL" -O mmw
+    wget -q --show-progress "$DOWNLOAD_URL" -O mmwx
 
     # 赋予执行权限
-    chmod +x mmw
+    chmod +x mmwx
 
     # 创建数据目录
     mkdir -p data
@@ -63,11 +64,11 @@ install() {
 
     # 设置环境变量并运行
     export PORT=$PORT
-    nohup ./mmw > mmw.log 2>&1 &
+    nohup ./mmwx > mmwx.log 2>&1 &
 
     # 显示完成信息
     echo ""
-    echo "✅ 安装完成！"
+    echo "安装完成！"
     echo ""
     echo "访问地址: http://localhost:$PORT"
     echo ""
@@ -81,12 +82,11 @@ install() {
 
 # 更新函数
 update() {
-    echo "正在更新妙妙屋X ($ARCH)..."
-    echo ""
+    echo "正在更新 mmwX Pro ($ARCH)..."
 
     # 检查是否已安装
-    if [ ! -f "mmw" ]; then
-        echo "❌ 未检测到已安装的 mmw，请先运行安装"
+    if [ ! -f "mmwx" ]; then
+        echo "未检测到已安装的 mmwx，请先执行安装"
         exit 1
     fi
 
@@ -99,24 +99,24 @@ update() {
     echo ""
 
     # 查找并停止运行中的进程
-    if pgrep -f "./mmw" > /dev/null; then
+    if pgrep -f "./mmwx" > /dev/null; then
         echo "停止运行中的服务..."
-        pkill -f "./mmw" || true
+        pkill -f "./mmwx" || true
         sleep 2
     fi
 
     # 备份当前版本
-    if [ -f "mmw" ]; then
+    if [ -f "mmwx" ]; then
         echo "备份当前版本..."
-        cp mmw mmw.bak
+        cp mmwx mmwx.bak
     fi
 
     # 下载新版本
     echo "下载新版本..."
-    wget -q --show-progress "$DOWNLOAD_URL" -O mmw
+    wget -q --show-progress "$DOWNLOAD_URL" -O mmwx
 
     # 赋予执行权限
-    chmod +x mmw
+    chmod +x mmwx
 
     # 保存版本信息
     echo "$VERSION" > "$VERSION_FILE"
@@ -157,7 +157,7 @@ update() {
 
     # 设置环境变量并运行
     export PORT=$PORT
-    nohup ./mmw > mmw.log 2>&1 &
+    nohup ./mmwx > mmwx.log 2>&1 &
 
     echo ""
     echo "✅ 更新完成！"
@@ -166,24 +166,23 @@ update() {
     echo "🌐 访问地址: http://localhost:$PORT"
     echo ""
     echo "运行服务:"
-    echo "  PORT=$PORT ./mmw"
+    echo "  PORT=$PORT ./mmwx"
     echo ""
     echo "后台运行:"
-    echo "  PORT=$PORT nohup ./mmw > mmw.log 2>&1 &"
+    echo "  PORT=$PORT nohup ./mmwx > mmwx.log 2>&1 &"
     echo ""
     echo "如遇问题可回滚到备份版本:"
-    echo "  mv mmw.bak mmw"
+    echo "  mv mmwx.bak mmwx"
     echo ""
 }
 
 # 卸载函数
 uninstall() {
-    echo "正在卸载妙妙屋X..."
-    echo ""
+    echo "正在卸载 mmwX Pro..."
 
     # 检查是否已安装
-    if [ ! -f "mmw" ]; then
-        echo "❌ 未检测到已安装的 mmw"
+    if [ ! -f "mmwx" ]; then
+        echo "未检测到已安装的 mmwx"
         exit 1
     fi
 
@@ -195,11 +194,11 @@ uninstall() {
     fi
 
     # 查找并停止运行中的进程
-    if pgrep -f "./mmw" > /dev/null; then
+    if pgrep -f "./mmwx" > /dev/null; then
         echo "停止运行中的服务..."
-        pkill -f "./mmw" || true
+        pkill -f "./mmwx" || true
         sleep 2
-        echo "✓ 服务已停止"
+        echo "✅ 服务已停止"
         echo ""
     fi
 
@@ -232,15 +231,15 @@ uninstall() {
 
     # 删除主程序和版本文件
     echo "删除程序文件..."
-    rm -f mmw mmw.bak "$VERSION_FILE" "$PORT_FILE" mmw.log
-    echo "✓ 程序文件已删除"
+    rm -f mmwx mmwx.bak "$VERSION_FILE" "$PORT_FILE" mmwx.log
+    echo "✅ 程序文件已删除"
     echo ""
 
     # 根据选择删除或保留数据
     if [ "$KEEP_DATA" = "false" ]; then
         echo "删除数据和配置..."
         rm -rf data/ subscribes/
-        echo "✓ 数据和配置已删除"
+        echo "✅ 数据和配置已删除"
         echo ""
         echo "✅ 卸载完成！所有文件已删除"
     else
